@@ -223,9 +223,18 @@ export class Music implements MusicUi {
     return this.wanted && !this.paused && !this.muted
   }
 
+  /** Consume a user gesture while it is still current without starting the
+   * transport. The graph is silent at zero master gain until `begin()` makes
+   * it live after scene entry. */
+  arm(): void {
+    window.clearTimeout(this.suspendTimer)
+    this.suspendTimer = 0
+    if (this.ctx.state === 'suspended') void this.ctx.resume().catch(() => undefined)
+  }
+
   /** Scene entered: the loop starts over from the top. Always downstream of
-   * a door click, so the context's autoplay gate is already satisfied - but
-   * the gesture fallback stays for the day it is not. */
+   * the door click that armed the context. The gesture fallback stays for
+   * browsers that still defer or refuse that resume. */
   begin(): void {
     if (this.wanted) return
     this.wanted = true

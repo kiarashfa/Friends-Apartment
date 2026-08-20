@@ -15,6 +15,10 @@ import { Ui } from './ui/ui'
 import { Music } from './audio/music'
 import { blenderFilmicVeryHighContrast } from './core/filmic'
 import { isDesktopChromium } from './core/platform'
+import {
+  installRendererFailureHandlers,
+  type RendererFailure,
+} from './core/rendererFailure'
 
 interface GpuProbe {
   requestAdapter():Promise<{limits:{maxSampledTexturesPerShaderStage:number;maxSamplersPerShaderStage:number}}|null>
@@ -28,7 +32,39 @@ interface BuiltApartment {
 
 const nextFrame=():Promise<void>=>new Promise((resolve)=>requestAnimationFrame(()=>resolve()))
 
+let bootStage='module'
+let fatalShown=false
+let stopActiveRendering:()=>void=()=>undefined
+
+const describeFailure=(error:unknown):string=>error instanceof Error?`${error.name}: ${error.message}`:String(error)
+
+function showFatalError(title:string,error:unknown):void{
+  if(fatalShown)return
+  fatalShown=true
+  stopActiveRendering()
+  const width=Math.max(1,innerWidth)
+  const height=Math.max(1,innerHeight)
+  const platform=(navigator as Navigator&{userAgentData?:{platform?:string}}).userAgentData?.platform
+    ??navigator.platform
+    ??'unknown platform'
+  const detail=describeFailure(error)
+  console.error(`[${bootStage}] ${title}: ${detail}`,error)
+  Ui.fatal(`${title} · Stage ${bootStage} · ${detail} · ${width}×${height} CSS px · DPR ${devicePixelRatio.toFixed(2)} · ${platform}`)
+}
+
+function recommendedPixelRatio(width:number,height:number):number{
+  const dpr=Math.min(devicePixelRatio,1.7,Math.sqrt(4_000_000/Math.max(1,width*height)))
+  return Number.isFinite(dpr)&&dpr>0?dpr:1
+}
+
+function commitRendererSize(renderer:THREE.WebGPURenderer,width:number,height:number):void{
+  renderer.setDrawingBufferSize(width,height,recommendedPixelRatio(width,height))
+  renderer.domElement.style.width=`${width}px`
+  renderer.domElement.style.height=`${height}px`
+}
+
 async function boot():Promise<void> {
+  bootStage='platform-gate'
   if(!isDesktopChromium(navigator)){Ui.fatal('Desktop Chromium required');return}
   if(!('gpu' in navigator)){Ui.fatal('WebGPU required');return}
   let requestEntry:(id:ApartmentId)=>void=()=>undefined
@@ -42,6 +78,7 @@ async function boot():Promise<void> {
     music,
   })
 
+  bootStage='adapter-limits'
   let requiredLimits:Record<string,number>={}
   try{
     const adapter=await (navigator as unknown as {gpu:GpuProbe}).gpu.requestAdapter()
@@ -51,8 +88,25 @@ async function boot():Promise<void> {
     }
   }catch{requiredLimits={}}
 
-  const renderer=new THREE.WebGPURenderer({antialias:true,requiredLimits} as ConstructorParameters<typeof THREE.WebGPURenderer>[0])
-  try{await renderer.init()}catch{Ui.fatal('WebGPU required');return}
+  bootStage='renderer-init'
+  const renderer=new THREE.WebGPURenderer({
+    // The scene MRT owns 4x MSAA. Multisampling the final fullscreen canvas
+    // adds another resolve without improving geometry edges.
+    antialias:false,
+    requiredLimits,
+  } as ConstructorParameters<typeof THREE.WebGPURenderer>[0])
+  const handleRendererFailure=(failure:RendererFailure):void=>{
+    showFatalError(
+      failure.kind==='device-lost'?'Graphics device lost':'Graphics error',
+      new Error(`${failure.type}: ${failure.message}`),
+    )
+  }
+  const attachUncapturedErrorHandler=installRendererFailureHandlers(renderer,handleRendererFailure)
+  try{
+    await renderer.init()
+    attachUncapturedErrorHandler()
+  }catch(error){showFatalError('WebGPU initialization failed',error);return}
+  if(fatalShown)return
   renderer.toneMapping=THREE.NoToneMapping
   renderer.toneMappingExposure=1
   renderer.shadowMap.enabled=true
@@ -60,33 +114,37 @@ async function boot():Promise<void> {
   THREE.Cache.enabled=true
   document.body.appendChild(renderer.domElement)
 
-  const setSize=():void=>{
-    const maxPixels=4_000_000
-    const dpr=Math.min(window.devicePixelRatio,1.7,Math.sqrt(maxPixels/(innerWidth*innerHeight)))
-    renderer.setPixelRatio(Math.max(1,dpr));renderer.setSize(innerWidth,innerHeight)
-  }
-  setSize()
+  const initialWidth=Math.max(1,innerWidth)
+  const initialHeight=Math.max(1,innerHeight)
+  commitRendererSize(renderer,initialWidth,initialHeight)
 
-  const camera=new THREE.PerspectiveCamera(66,innerWidth/innerHeight,0.02,300)
+  const camera=new THREE.PerspectiveCamera(66,initialWidth/initialHeight,0.02,300)
   camera.up.set(0,0,1)
   let controls:PlayerControls|null=null
   let seats:SeatingSystem|null=null
   let active:BuiltApartment|null=null
   let entryTarget:ApartmentId|null=null
   let entryReady=false
+  let entering=false
   let started=false
   let toHallway=false
   let rendering=false
   const requestPointerLock=():void=>{
     try{void renderer.domElement.requestPointerLock().catch(()=>undefined)}catch{/* Unsupported options/permissions stay on the landing. */}
   }
-  requestResume=()=>{if(active)requestPointerLock()}
+  requestResume=()=>{
+    if(!active)return
+    music.arm()
+    requestPointerLock()
+  }
 
   // The pass graph is apartment-agnostic and can be created over an empty
   // scene. Only PassNode.scene changes after an apartment cache entry exists.
   const emptyScene=new THREE.Scene()
   const postProcessing=new THREE.PostProcessing(renderer)
-  const scenePass=pass(emptyScene,camera,{samples:renderer.samples})
+  // Preserve the exact authored scene anti-aliasing after disabling redundant
+  // MSAA on the final presentation canvas.
+  const scenePass=pass(emptyScene,camera,{samples:4})
   scenePass.setMRT(mrt({output,normal:normalView}))
   const scenePassColor=scenePass.getTextureNode('output')
   const scenePassNormal=scenePass.getTextureNode('normal')
@@ -105,16 +163,23 @@ async function boot():Promise<void> {
   // Prime render targets and apartment-independent post shaders after the DOM
   // landing has painted. A selected apartment may download concurrently, but
   // its geometry/material compilation waits for this shared work to finish.
-  let sharedPipelineError:unknown=null
   const sharedPipelineReady=(async()=>{
     await nextFrame()
+    bootStage='shared-pipeline-warmup'
     scenePass.scene=emptyScene
     postProcessing.render()
     await nextFrame()
-  })().catch((error)=>{sharedPipelineError=error})
+  })
 
   const clock=new THREE.Clock(false)
-  const stopRendering=():void=>{if(!rendering)return;renderer.setAnimationLoop(null);clock.stop();rendering=false}
+  let cancelEntryFrame:(()=>void)|null=null
+  const stopRendering=():void=>{
+    if(rendering){renderer.setAnimationLoop(null);clock.stop();rendering=false}
+    const cancel=cancelEntryFrame
+    cancelEntryFrame=null
+    cancel?.()
+  }
+  stopActiveRendering=stopRendering
   // Every apartment is a still life - no time-driven node, animated texture or
   // runtime shadow update - so a frame can only differ when the camera pose
   // changed (walking, look, bob, seat choreography, seated breathing) or an
@@ -138,6 +203,37 @@ async function boot():Promise<void> {
     postProcessing.render()
   }
   const startRendering=():void=>{if(rendering)return;rendering=true;needsRender=true;clock.start();renderer.setAnimationLoop(renderFrame)}
+  const startEntryRendering=():Promise<boolean>=>{
+    if(rendering)return Promise.resolve(true)
+    rendering=true
+    needsRender=true
+    clock.start()
+    return new Promise((resolve,reject)=>{
+      let pending=true
+      cancelEntryFrame=()=>{
+        if(!pending)return
+        pending=false
+        resolve(false)
+      }
+      renderer.setAnimationLoop(()=>{
+        if(!pending)return
+        try{renderFrame()}
+        catch(error){
+          pending=false
+          cancelEntryFrame=null
+          renderer.setAnimationLoop(null)
+          clock.stop()
+          rendering=false
+          reject(error)
+          return
+        }
+        pending=false
+        cancelEntryFrame=null
+        renderer.setAnimationLoop(renderFrame)
+        resolve(true)
+      })
+    })
+  }
 
   const poseForBuild=(definition:ApartmentDefinition):void=>{
     const [x,y]=definition.spawn.position
@@ -198,16 +294,19 @@ async function boot():Promise<void> {
     const existing=pending.get(id)
     if(existing)return existing
     const request=(async()=>{
+      bootStage=`scene:${id}:definition`
       const definitionRequest=loadApartmentDefinition(id)
       const [definition]=await Promise.all([definitionRequest,sharedPipelineReady])
-      if(sharedPipelineError!==null)throw sharedPipelineError
       await nextFrame()
+      bootStage=`scene:${id}:build`
       const world=new World()
       await definition.build(world)
       const meshes:THREE.Mesh[]=[]
       world.scene.traverse((object)=>{if((object as THREE.Mesh).isMesh)meshes.push(object as THREE.Mesh)})
       const apartment={definition,world,meshes}
+      bootStage=`scene:${id}:compile`
       await compileApartment(apartment)
+      bootStage=`scene:${id}:shadow-warmup`
       await warmApartment(apartment)
       built.set(id,apartment)
       return apartment
@@ -239,35 +338,56 @@ async function boot():Promise<void> {
   }
 
   const tryEnter=():void=>{
-    if(!entryReady||!entryTarget||active?.definition.id!==entryTarget)return
+    if(entering||!entryReady||!entryTarget||active?.definition.id!==entryTarget)return
     if(document.pointerLockElement!==renderer.domElement)return
-    entryReady=false
-    entryTarget=null
-    started=true
-    ui.enterGame()
-    startRendering()
-    // Every scene entry - first visit or back through the hallway - starts
-    // the loop from the top, downstream of the door click's activation.
-    music.begin()
+    entering=true
+    const target=entryTarget
+    void startEntryRendering().then((rendered)=>{
+      entering=false
+      if(!rendered||fatalShown||entryTarget!==target||active?.definition.id!==target
+        ||document.pointerLockElement!==renderer.domElement){
+        if(!started)stopRendering()
+        return
+      }
+      entryReady=false
+      entryTarget=null
+      started=true
+      bootStage=`scene:${target}:running`
+      // The first live animation-loop frame is already submitted behind the
+      // loading veil, so opening it cannot expose first-frame work or a blank.
+      ui.enterGame()
+      music.begin()
+    }).catch((error)=>{
+      entering=false
+      showFatalError('Rendering failed',error)
+    })
   }
 
   requestEntry=(id)=>{
+    // Both Web Audio and pointer lock must consume the door click's transient
+    // activation synchronously. Arming is silent; playback starts only after
+    // a rendered scene frame and a successful pointer-lock handshake.
+    music.arm()
+    if(entryReady&&entryTarget===id&&active?.definition.id===id){
+      requestPointerLock()
+      tryEnter()
+      return
+    }
     entryTarget=id
     entryReady=false
     ui.beginLoading(id)
-    // Pointer lock must be requested while the door click still owns transient
-    // user activation; scene import/compilation continues behind the landing.
     requestPointerLock()
     void (async()=>{
       try{
         const apartment=await getApartment(id)
-        if(entryTarget!==id)return
+        if(fatalShown||entryTarget!==id)return
+        bootStage=`scene:${id}:activate`
         await activateApartment(apartment)
-        if(entryTarget!==id)return
+        if(fatalShown||entryTarget!==id)return
         entryReady=true
         ui.finishLoading()
         tryEnter()
-      }catch{
+      }catch(error){
         if(entryTarget!==id)return
         entryTarget=null
         entryReady=false
@@ -275,18 +395,29 @@ async function boot():Promise<void> {
         stopRendering()
         ui.finishLoading()
         if(document.pointerLockElement===renderer.domElement)document.exitPointerLock()
-        Ui.fatal('Scene unavailable')
+        showFatalError('Scene unavailable',error)
       }
     })()
   }
 
+  let resizeFrame:number|null=null
   window.addEventListener('resize',()=>{
-    setSize();camera.aspect=innerWidth/innerHeight
-    camera.updateProjectionMatrix()
-    needsRender=true
+    if(fatalShown||resizeFrame!==null)return
+    resizeFrame=requestAnimationFrame(()=>{
+      resizeFrame=null
+      if(fatalShown)return
+      const width=innerWidth
+      const height=innerHeight
+      if(width===0||height===0)return
+      commitRendererSize(renderer,width,height)
+      camera.aspect=width/height
+      camera.updateProjectionMatrix()
+      needsRender=true
+    })
   })
 
   document.addEventListener('pointerlockchange',()=>{
+    if(fatalShown)return
     const locked=document.pointerLockElement===renderer.domElement
     if(controls)controls.enabled=locked&&!!active
     if(locked){
@@ -294,17 +425,24 @@ async function boot():Promise<void> {
       else if(started&&active){ui.enterGame();startRendering();music.resume()}
       return
     }
-    if(entryTarget)return
+    if(entryTarget){
+      if(entering)stopRendering()
+      return
+    }
     if(started){
       stopRendering()
       // Esc holds the loop where it stands; walking out resets it, so the
       // next scene starts the music over.
-      if(toHallway){toHallway=false;ui.showHallway();music.reset()}
+      if(toHallway){toHallway=false;bootStage='landing';ui.showHallway();music.reset()}
       else{ui.showPause();music.pause()}
     }
   })
 
+  bootStage='shared-pipeline-warmup'
+  await sharedPipelineReady
+  if(fatalShown)return
+  bootStage='landing'
   ui.ready()
 }
 
-void boot()
+void boot().catch((error)=>showFatalError('Loading failed',error))

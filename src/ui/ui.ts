@@ -776,18 +776,19 @@ export class Ui {
 
   static fatal(msg: string): void {
     installStyles()
-    document.body.appendChild(
-      build(`
+    const root = build(`
       <div class="veil fatal">
         <div class="door">
           <div class="grain"></div>
           <div class="molding"></div>
           <div class="stack">
             <img class="emblem" src="/decoration.png" alt="" draggable="false">
-            <p class="msg">${msg}</p>
+            <p class="msg"></p>
           </div>
         </div>
-      </div>`),
-    )
+      </div>`)
+    const message = root.querySelector<HTMLElement>('.msg')
+    if (message) message.textContent = msg
+    document.body.appendChild(root)
   }
 }

@@ -121,10 +121,11 @@ a clean output trim.
 
 ## Lifecycle: the music belongs to the scenes
 
-Silent on the landing; no in-game UI. `main.ts` drives four transport calls:
+Silent on the landing; no in-game UI. `main.ts` drives the lifecycle calls:
 
 | Moment | Call | Effect |
 | --- | --- | --- |
+| Door clicked | `arm()` | silently unlocks Web Audio during transient activation |
 | Scene entered (`tryEnter`) | `begin()` | loop starts from the top |
 | Esc (pause veil up) | `pause()` | fade out, context suspends, position holds |
 | Pointer lock re-acquired | `resume()` | picks up exactly where pause left it |
@@ -147,8 +148,11 @@ marks the graph **stale** — the next `begin()` rebuilds the synth, so the
 dead scene's already-scheduled tail (the lookahead runs ~1.5 s deep) can
 never leak into the next scene's fresh start.
 
-`begin()` always runs downstream of a door click, so the autoplay gate is
-already satisfied; the one-shot gesture fallback stays for the day it is not.
+`arm()` calls `AudioContext.resume()` synchronously inside the door click, while
+the synth master is still zero and the transport is not wanted, so it cannot
+schedule or emit music. `begin()` runs only after pointer lock and the first
+live scene frame have succeeded. The one-shot gesture fallback remains for a
+browser that still defers or refuses the original resume.
 
 ## Transport
 
