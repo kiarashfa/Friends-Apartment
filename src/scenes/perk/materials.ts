@@ -10,6 +10,8 @@ import {
   add,
   clamp,
   cos,
+  dFdx,
+  dFdy,
   atan,
   dot,
   float,
@@ -20,11 +22,13 @@ import {
   min,
   mix,
   mul,
+  mx_noise_float,
   normalWorld,
   positionLocal,
   pow,
   select,
   sin,
+  smoothstep,
   sqrt,
   sub,
   texture,
@@ -33,7 +37,7 @@ import {
   vec3,
 } from 'three/tsl'
 import { principled, pane as sharedPane, emissive as sharedEmissive, type N } from '../../mats/mats'
-import { bnoise, bnoise3, bumpNormal, layerWeightFacing, lum, mapping, ramp, rampF, srgb, srgbTriple, voronoi } from '../../mats/tsl'
+import { bnoise, bumpNormal, layerWeightFacing, lum, mapping, ramp, rampF, srgb, srgbTriple, voronoi } from '../../mats/tsl'
 
 const TAU = Math.PI * 2
 
@@ -64,6 +68,83 @@ const scaled = (hex: string, k: number, warm = 1): [number, number, number] =>
 
 /** Boolean node -> 0/1 float, so comparisons can drive mix factors. */
 const bit = (cond: N): N => select(cond, float(1), float(0))
+
+interface FilteredNoise {
+  value: N
+  /** Fraction of procedural detail removed after it crossed the pixel footprint. */
+  unresolved: N
+}
+
+interface FilteredMask {
+  value: N
+  unresolved: N
+}
+
+/** Conservative scalar footprint for analytic step/ramp filtering. */
+function footprint1(p: N): N {
+  return add(abs(dFdx(p)), abs(dFdy(p)))
+}
+
+/** Length of the widest screen derivative in a 3-D procedural coordinate. */
+function footprint3(p: N): N {
+  const dx = dFdx(p)
+  const dy = dFdy(p)
+  return max(sqrt(dot(dx, dx)), sqrt(dot(dy, dy)))
+}
+
+/** Band-limited counterpart to bnoise for materials that visibly shimmer.
+ * Each octave fades independently around Nyquist; discarded zero-mean noise
+ * converges to 0.5 instead of turning into unstable pixel-scale contrast. */
+function filteredNoise(p: N, scale: number, detail = 2, rough = 0.5): FilteredNoise {
+  const q = mul(p, scale)
+  const octaves = Math.floor(Math.min(15, Math.max(0, detail)))
+  let sum: N = float(0)
+  let retained: N = float(0)
+  let amplitude = 1
+  let totalAmplitude = 0
+  let frequency = 1
+  for (let i = 0; i <= octaves; i++) {
+    const samplePoint = mul(q, frequency)
+    const keep = sub(1, smoothstep(0.35, 1.25, footprint3(samplePoint)))
+    sum = add(sum, mul(mx_noise_float(samplePoint), mul(amplitude, keep)))
+    retained = add(retained, mul(amplitude, keep))
+    totalAmplitude += amplitude
+    amplitude *= rough
+    frequency *= 2
+  }
+  return {
+    value: add(mul(sum.div(totalAmplitude), 0.5), 0.5),
+    unresolved: clamp(sub(1, retained.div(totalAmplitude)), 0, 1),
+  }
+}
+
+function filteredNoise3(p: N, scale: number, detail = 2, rough = 0.5): FilteredNoise {
+  const x = filteredNoise(p, scale, detail, rough)
+  const y = filteredNoise(add(p, vec3(23.1, 113.2, 71.7)), scale, detail, rough)
+  const z = filteredNoise(add(p, vec3(-58.9, 17.4, 155.2)), scale, detail, rough)
+  return { value: vec3(x.value, y.value, z.value), unresolved: x.unresolved }
+}
+
+/** Anti-aliased triangular band used by narrow procedural stone veins. */
+function filteredBand(source: FilteredNoise, lo: number, mid: number, hi: number): FilteredMask {
+  const resolved = rampF(source.value, [
+    [lo, 0],
+    [mid, 1],
+    [hi, 0],
+  ])
+  const halfWidth = Math.min(mid - lo, hi - mid)
+  const footprintKeep = sub(1, smoothstep(halfWidth * 0.2, halfWidth * 1.5, footprint1(source.value)))
+  const keep = mul(footprintKeep, sub(1, source.unresolved))
+  return {
+    value: mix(float((hi - lo) * 0.5), resolved, keep),
+    unresolved: sub(1, keep),
+  }
+}
+
+/** Preserve the energy of filtered micro-normal detail as a broader lobe. */
+function filteredRoughness(roughness: N, unresolved: N, strength: number): N {
+  return clamp(sqrt(add(mul(roughness, roughness), mul(unresolved, strength))), 0, 1)
+}
 
 /** Vector along a vertical surface: u = horizontal arc-length in the wall
  * plane, v = z (mats.wall_proj). */
@@ -306,27 +387,42 @@ export function brick(name: string, o: BrickOpts = {}): THREE.Material {
     const fx = abs(sub(fract(xs), 0.5))
     const fy = abs(sub(fract(sv), 0.5))
     const rnd = cellRand(cell, 3)
-    const jx = bit(fx.greaterThan(0.5 - mort / bw))
-    const jy = bit(fy.greaterThan(0.5 - mort / bh))
-    const joint = max(jx, jy)
-    const roughN = bnoise(positionLocal, 160, 8, 0.72)
-    const blot = bnoise(positionLocal, 9, 6, 0.6)
+    const footprintX = max(footprint1(xs), 1e-4)
+    const footprintY = max(footprint1(sv), 1e-4)
+    const cellFootprint = max(footprintX, footprintY)
+    const edgeX = 0.5 - mort / bw
+    const edgeY = 0.5 - mort / bh
+    const jx = smoothstep(sub(edgeX, footprintX), add(edgeX, footprintX), fx)
+    const jy = smoothstep(sub(edgeY, footprintY), add(edgeY, footprintY), fy)
+    const resolvedJoint = max(jx, jy)
+    // A periodic mortar grid aliases well before a whole brick collapses to a
+    // pixel. Fade its contrast from roughly 28 px/cell and converge to its
+    // area average before the grid reaches the moire-prone 2–3 px range.
+    const patternKeep = sub(1, smoothstep(0.035, 0.35, cellFootprint))
+    const meanJoint = 1 - (1 - Math.min(1, (2 * mort) / bw)) * (1 - Math.min(1, (2 * mort) / bh))
+    const joint = mix(float(meanJoint), resolvedJoint, patternKeep)
+    const roughN = filteredNoise(positionLocal, 160, 8, 0.72)
+    const blot = filteredNoise(positionLocal, 9, 6, 0.6)
     const f1 = srgbTriple(face)
     const f2 = srgbTriple(face2)
     const s = spread
-    const tone = ramp(rnd, [
+    const resolvedTone = ramp(rnd, [
       [0, scaled(face2, 1 - 0.42 * s)],
       [0.34, [...f2] as [number, number, number]],
       [0.66, [...f1] as [number, number, number]],
       [1, scaled(face, 1 + 0.55 * s, 1.06)],
     ])
-    const tone2 = mix(tone, vec3(f2[0] * 0.7, f2[1] * 0.72, f2[2] * 0.7), blot)
-    const tone3 = mix(tone2, vec3(Math.min(1, f1[0] * 1.15), Math.min(1, f1[1] * 1.1), Math.min(1, f1[2] * 1.05)), roughN)
+    const meanTone = vec3((f1[0] + f2[0]) * 0.5, (f1[1] + f2[1]) * 0.5, (f1[2] + f2[2]) * 0.5)
+    const tone = mix(meanTone, resolvedTone, patternKeep)
+    const tone2 = mix(tone, vec3(f2[0] * 0.7, f2[1] * 0.72, f2[2] * 0.7), blot.value)
+    const tone3 = mix(tone2, vec3(Math.min(1, f1[0] * 1.15), Math.min(1, f1[1] * 1.1), Math.min(1, f1[2] * 1.05)), roughN.value)
     const col = mix(tone3, srgb(mortar), joint)
     const rg = mix(float(0.62), float(0.92), joint)
-    const hj = sub(mul(roughN, 0.35), joint)
+    const unresolved = max(max(roughN.unresolved, blot.unresolved), sub(1, patternKeep))
+    const rgAa = filteredRoughness(rg, unresolved, 0.12)
+    const hj = sub(mul(roughN.value, 0.35), joint)
     const bp = bumpNormal(hj, 0.75, 0.01)
-    return principled({ base: col, roughN: rg, normal: bp, spec: 0.28 })
+    return principled({ base: col, roughN: rgAa, normal: bp, spec: 0.28 })
   })
 }
 
@@ -381,20 +477,24 @@ export function paint(name: string, hexcol: string, o: PaintOpts = {}): THREE.Ma
 export function iron(name: string, hexcol = '17372B', rough = 0.42): THREE.Material {
   return cached(name, () => {
     const v = mapping(positionLocal, [50, 50, 50])
-    const cast = bnoise(v, 8, 8, 0.72)
-    const pit = clamp(voronoi(v, 62).distance, 0, 1)
+    const cast = filteredNoise(v, 8, 8, 0.72)
+    const rawPit = clamp(voronoi(v, 62).distance, 0, 1)
+    const pitKeep = sub(1, smoothstep(0.35, 1.25, footprint3(mul(v, 62))))
+    const pit = mix(float(0.5), rawPit, pitKeep)
     const base = srgbTriple(hexcol)
     const c = mix(
       vec3(...(base.map((x) => x * 0.8) as [number, number, number])),
       vec3(...(base.map((x) => Math.min(1, x * 1.18)) as [number, number, number])),
-      cast,
+      cast.value,
     )
-    const rg = rampF(cast, [
+    const rg = rampF(cast.value, [
       [0.15, rough - 0.1],
       [0.85, rough + 0.12],
     ])
-    const bp = bumpNormal(add(mul(cast, 0.6), pit), 0.3, 0.7)
-    return principled({ base: c, roughN: rg, normal: bp, spec: 0.55 })
+    const unresolved = max(cast.unresolved, sub(1, pitKeep))
+    const rgAa = filteredRoughness(rg, unresolved, 0.16)
+    const bp = bumpNormal(add(mul(cast.value, 0.6), pit), 0.3, 0.7)
+    return principled({ base: c, roughN: rgAa, normal: bp, spec: 0.55 })
   })
 }
 
@@ -418,29 +518,40 @@ export function wood(name: string, o: WoodOpts = {}): THREE.Material {
       Z: [scale * ring, scale * ring, scale],
     }
     const v = mapping(positionLocal, sc[axis])
-    const warp = bnoise3(v, 1.1, 6, 0.6)
-    const wv = add(v, warp)
+    const warp = filteredNoise3(v, 1.1, 6, 0.6)
+    const wv = add(v, warp.value)
     // Blender TexWave RINGS with the default rings direction: radial distance
     // around the X axis, sin profile, distortion 6, detail 3.
     let n: N = mul(sqrt(add(mul(wv.y, wv.y), mul(wv.z, wv.z))), 20)
-    n = add(n, mul(sub(mul(bnoise(wv, 1, 3, 0.5), 2), 1), 6))
+    const distortion = filteredNoise(wv, 1, 3, 0.5)
+    n = add(n, mul(sub(mul(distortion.value, 2), 1), 6))
+    const waveKeep = sub(1, smoothstep(0.5, Math.PI, footprint3(vec3(n, 0, 0))))
     const w2 = add(mul(sin(n), 0.5), 0.5)
-    const pore = bnoise(v, ring * 6, 4)
+    const pore = filteredNoise(v, ring * 6, 4)
     const lo = srgbTriple(dark)
     const hi = srgbTriple(light)
-    const c1 = ramp(w2, [
+    const resolvedRings = ramp(w2, [
       [0, [...lo] as [number, number, number]],
       [0.42, [...hi] as [number, number, number]],
       [0.58, [...hi] as [number, number, number]],
       [1, [...lo] as [number, number, number]],
     ])
-    const c2 = mix(c1, vec3(...lo), pore)
-    const rg = rampF(w2, [
+    const meanRings = vec3(lo[0] * 0.55 + hi[0] * 0.45, lo[1] * 0.55 + hi[1] * 0.45, lo[2] * 0.55 + hi[2] * 0.45)
+    const c1 = mix(meanRings, resolvedRings, waveKeep)
+    const c2 = mix(c1, vec3(...lo), pore.value)
+    const resolvedRoughness = rampF(w2, [
       [0.1, rough[1]],
       [0.9, rough[0]],
     ])
-    const bp = bumpNormal(add(w2, pore), bump, 0.5)
-    return principled({ base: c2, roughN: rg, normal: bp, spec: 0.5, coat })
+    const meanRoughness = (rough[0] + rough[1]) * 0.5
+    const rg = mix(float(meanRoughness), resolvedRoughness, waveKeep)
+    const unresolved = max(max(warp.unresolved, distortion.unresolved), max(pore.unresolved, sub(1, waveKeep)))
+    const rgAa = filteredRoughness(rg, unresolved, 0.18)
+    const filteredWave = mix(float(0.5), w2, waveKeep)
+    const bp = bumpNormal(add(filteredWave, pore.value), bump, 0.5)
+    const material = principled({ base: c2, roughN: rgAa, normal: bp, spec: 0.5, coat })
+    if (coat) material.clearcoatRoughnessNode = filteredRoughness(float(0.06), unresolved, 0.12)
+    return material
   })
 }
 
@@ -455,28 +566,22 @@ export function marble(name: string, o: MarbleOpts = {}): THREE.Material {
   return cached(name, () => {
     const { base = '9DA396', vein = '4C5A4A', vein2 = 'D8DCCE', scale = 2.4 } = o
     const v = mapping(positionLocal, [scale, scale * 0.55, scale])
-    const warp = bnoise3(v, 1.6, 8, 0.62)
-    const wv = add(v, mul(warp, 0.55))
-    const n1 = bnoise(wv, 3, 9, 0.55)
-    const v1 = rampF(n1, [
-      [0.44, 0],
-      [0.5, 1],
-      [0.56, 0],
-    ])
-    const n2 = bnoise(wv, 8, 7, 0.5)
-    const v2 = rampF(n2, [
-      [0.46, 0],
-      [0.5, 1],
-      [0.54, 0],
-    ])
-    const fld = bnoise(v, 2.2, 6)
+    const warp = filteredNoise3(v, 1.6, 8, 0.62)
+    const wv = add(v, mul(warp.value, 0.55))
+    const v1 = filteredBand(filteredNoise(wv, 3, 9, 0.55), 0.44, 0.5, 0.56)
+    const v2 = filteredBand(filteredNoise(wv, 8, 7, 0.5), 0.46, 0.5, 0.54)
+    const fld = filteredNoise(v, 2.2, 6)
     const bs = srgbTriple(base)
-    const c0 = mix(vec3(...bs), vec3(...(bs.map((x) => x * 0.78) as [number, number, number])), fld)
-    const c1 = mix(c0, srgb(vein), v1)
-    const c2 = mix(c1, srgb(vein2), v2)
-    const rg = mix(float(0.1), float(0.22), v1)
-    const bp = bumpNormal(v1, 0.06, 0.4)
-    return principled({ base: c2, roughN: rg, normal: bp, spec: 0.6, coat: 0.4 })
+    const c0 = mix(vec3(...bs), vec3(...(bs.map((x) => x * 0.78) as [number, number, number])), fld.value)
+    const c1 = mix(c0, srgb(vein), v1.value)
+    const c2 = mix(c1, srgb(vein2), v2.value)
+    const rg = mix(float(0.1), float(0.22), v1.value)
+    const unresolved = max(max(warp.unresolved, fld.unresolved), max(v1.unresolved, v2.unresolved))
+    const rgAa = filteredRoughness(rg, unresolved, 0.12)
+    const bp = bumpNormal(v1.value, 0.06, 0.4)
+    const material = principled({ base: c2, roughN: rgAa, normal: bp, spec: 0.6, coat: 0.4 })
+    material.clearcoatRoughnessNode = filteredRoughness(float(0.06), unresolved, 0.1)
+    return material
   })
 }
 

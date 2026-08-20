@@ -789,7 +789,9 @@ export function build(w: World, M?: MatSet): MatSet {
       O.place(o, [kc[0], kc[1], 0.0], [dxc, dyc], [-inw[0], -inw[1]])
       w.add(o, mm)
     }
-    const sl = mlib.box(-kw / 2 - 0.05, 0.0, -0.05, kw / 2 + 0.05, 0.18, 0.0)
+    // The wall helper caps the rough opening at KW_Z[0]. Let the sill own the
+    // visible plane instead of leaving its top exactly coplanar with that cap.
+    const sl = mlib.box(-kw / 2 - 0.05, 0.0, -0.05, kw / 2 + 0.05, 0.18, 0.004)
     mlib.bevel(sl, 0.006, 2)
     O.place(sl, [kc[0], kc[1], L.KW_Z[0]], [dxc, dyc], [-inw[0], -inw[1]])
     w.add(sl, M.stone)
@@ -839,7 +841,16 @@ export function build(w: World, M?: MatSet): MatSet {
       )
     }
     // stone sill inside + out
-    const si = mlib.box(L.BW_X[0] - 0.06, L.AL_Y[1] - 0.02, L.BW_SILL - 0.055, L.BW_X[1] + 0.06, L.AL_Y[1] + L.TW + 0.1, L.BW_SILL)
+    // As at the kitchen window, the sill covers the wall's opening cap. A
+    // small positive reveal gives the top surface a single depth owner.
+    const si = mlib.box(
+      L.BW_X[0] - 0.06,
+      L.AL_Y[1] - 0.02,
+      L.BW_SILL - 0.055,
+      L.BW_X[1] + 0.06,
+      L.AL_Y[1] + L.TW + 0.1,
+      L.BW_SILL + 0.004,
+    )
     mlib.bevel(si, 0.008, 2)
     w.add(si, M.stone)
     // Matchstick blinds hang down the upper half of the single leaned window.
