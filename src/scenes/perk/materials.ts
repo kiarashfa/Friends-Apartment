@@ -4,6 +4,7 @@
  * the Blender build sanctions (the Liberty canvas and the window decal).
  */
 import * as THREE from 'three/webgpu'
+import { sceneTexture } from '../../core/sceneAssets'
 import {
   Fn,
   abs,
@@ -960,7 +961,7 @@ export function neon(name: string, hexcol = 'FF2D55', strength = 26, glassCol = 
 
 export function imgMat(name: string, path: string, o: { emit?: number; alpha?: boolean; rough?: number } = {}): THREE.Material {
   return cached(name, () => {
-    const image = new THREE.TextureLoader().load(path)
+    const image = sceneTexture(path)
     image.colorSpace = THREE.SRGBColorSpace
     image.wrapS = THREE.ClampToEdgeWrapping
     image.wrapT = THREE.ClampToEdgeWrapping

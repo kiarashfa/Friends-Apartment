@@ -16,6 +16,13 @@ import { Music } from './audio/music'
 import { blenderFilmicVeryHighContrast } from './core/filmic'
 import { isDesktopChromium } from './core/platform'
 import {
+  COMPILE_BATCH_SIZE,
+  compileBatches,
+  freezeShadowUpdates,
+  shadowWarmupLights,
+} from './core/loading'
+import { preloadSceneAssets } from './core/sceneAssets'
+import {
   installRendererFailureHandlers,
   type RendererFailure,
 } from './core/rendererFailure'
@@ -160,6 +167,20 @@ async function boot():Promise<void> {
   postProcessing.outputColorTransform=false
   postProcessing.outputNode=renderOutput(vec4(displayLinear,hdrOutput.a),THREE.NoToneMapping,renderer.outputColorSpace)
 
+  const compileScenePass=async():Promise<void>=>{
+    const currentRenderTarget=renderer.getRenderTarget()
+    const currentMrt=renderer.getMRT()
+    try{
+      await scenePass.compileAsync(renderer)
+    }finally{
+      // PassNode restores these on success, but its compile method cannot
+      // restore them if pipeline creation rejects. Keep fatal startup paths
+      // from leaking pass state into the next diagnostic/render operation.
+      renderer.setRenderTarget(currentRenderTarget)
+      renderer.setMRT(currentMrt)
+    }
+  }
+
   // Prime render targets and apartment-independent post shaders after the DOM
   // landing has painted. A selected apartment may download concurrently, but
   // its geometry/material compilation waits for this shared work to finish.
@@ -167,9 +188,14 @@ async function boot():Promise<void> {
     await nextFrame()
     bootStage='shared-pipeline-warmup'
     scenePass.scene=emptyScene
+    // The first render creates the pass target and its configured MRT. The
+    // explicit pass compilation below then prepares the same attachments used
+    // by every apartment compile, instead of compiling a default single-output
+    // renderer configuration by accident.
     postProcessing.render()
+    await compileScenePass()
     await nextFrame()
-  })
+  })()
 
   const clock=new THREE.Clock(false)
   let cancelEntryFrame:(()=>void)|null=null
@@ -249,19 +275,44 @@ async function boot():Promise<void> {
     poseForBuild(definition)
     const previousScene=scenePass.scene
     const visible=meshes.map((mesh)=>mesh.visible)
+    const compileMeshes=meshes.filter((mesh)=>mesh.visible)
     scenePass.scene=world.scene
-    renderer.setRenderTarget(scenePass.renderTarget)
     try{
-      const chunkSize=12
-      for(let start=0;start<meshes.length;start+=chunkSize){
-        meshes.forEach((mesh,index)=>{mesh.visible=visible[index]&&index>=start&&index<start+chunkSize})
-        await renderer.compileAsync(world.scene,camera)
-        await nextFrame()
+      // Hide the complete scene once, then only toggle the current batch. The
+      // old implementation scanned every mesh for every batch and compiled
+      // against renderer state without the pass MRT.
+      meshes.forEach((mesh)=>{mesh.visible=false})
+      for(const {start,end} of compileBatches(compileMeshes.length,COMPILE_BATCH_SIZE)){
+        for(let index=start;index<end;index++)compileMeshes[index].visible=true
+        await compileScenePass()
+        for(let index=start;index<end;index++)compileMeshes[index].visible=false
+        if(end<compileMeshes.length)await nextFrame()
       }
     }finally{
       meshes.forEach((mesh,index)=>{mesh.visible=visible[index]})
-      renderer.setRenderTarget(null)
       scenePass.scene=previousScene
+    }
+  }
+
+  const renderScenePassOnly=():void=>{
+    const currentRenderTarget=renderer.getRenderTarget()
+    const currentMrt=renderer.getMRT()
+    const currentAutoClear=renderer.autoClear
+    const currentTransparent=renderer.transparent
+    const currentOpaque=renderer.opaque
+    try{
+      renderer.setRenderTarget(scenePass.renderTarget)
+      renderer.setMRT(scenePass.getMRT())
+      renderer.autoClear=true
+      renderer.transparent=scenePass.transparent
+      renderer.opaque=scenePass.opaque
+      renderer.render(scenePass.scene,camera)
+    }finally{
+      renderer.setRenderTarget(currentRenderTarget)
+      renderer.setMRT(currentMrt)
+      renderer.autoClear=currentAutoClear
+      renderer.transparent=currentTransparent
+      renderer.opaque=currentOpaque
     }
   }
 
@@ -270,13 +321,12 @@ async function boot():Promise<void> {
     const previousScene=scenePass.scene
     scenePass.scene=apartment.world.scene
     try{
-      // Freeze every map before the first warm-up pass: a light still on
-      // autoUpdate re-renders its map during every earlier light's pass.
-      for(const light of apartment.world.lights)if(light.castShadow&&light.shadow)light.shadow.autoUpdate=false
-      for(const light of apartment.world.lights){
-        if(!light.castShadow||!light.shadow)continue
+      for(const light of shadowWarmupLights(apartment.world.lights)){
+        if(!light.shadow)continue
         light.shadow.needsUpdate=true
-        postProcessing.render()
+        // Shadow maps still warm one at a time, but the expensive AO/bloom/
+        // presentation graph is deferred until all maps are settled.
+        renderScenePassOnly()
         await nextFrame()
       }
       // One settled full-scene frame primes the shared AO/bloom/presentation
@@ -296,7 +346,8 @@ async function boot():Promise<void> {
     const request=(async()=>{
       bootStage=`scene:${id}:definition`
       const definitionRequest=loadApartmentDefinition(id)
-      const [definition]=await Promise.all([definitionRequest,sharedPipelineReady])
+      const assetsReady=preloadSceneAssets(id)
+      const [definition]=await Promise.all([definitionRequest,assetsReady,sharedPipelineReady])
       await nextFrame()
       bootStage=`scene:${id}:build`
       const world=new World()
@@ -304,6 +355,9 @@ async function boot():Promise<void> {
       const meshes:THREE.Mesh[]=[]
       world.scene.traverse((object)=>{if((object as THREE.Mesh).isMesh)meshes.push(object as THREE.Mesh)})
       const apartment={definition,world,meshes}
+      // Prevent compileAsync from rendering partial shadow maps while mesh
+      // visibility is being chunked. The complete maps are populated below.
+      freezeShadowUpdates(world.lights)
       bootStage=`scene:${id}:compile`
       await compileApartment(apartment)
       bootStage=`scene:${id}:shadow-warmup`
@@ -315,11 +369,15 @@ async function boot():Promise<void> {
       throw error
     })
     pending.set(id,request)
-    void request.then(()=>pending.delete(id))
+    void request.then(()=>pending.delete(id),()=>pending.delete(id))
     return request
   }
 
-  const activateApartment=async(apartment:BuiltApartment):Promise<void>=>{
+  let seatingModulePromise:Promise<typeof import('./player/seats')>|null=null
+  const loadSeatingModule=():Promise<typeof import('./player/seats')> =>
+    seatingModulePromise??=(import('./player/seats'))
+
+  const activateApartment=async(apartment:BuiltApartment,seatingModule:Promise<typeof import('./player/seats')>):Promise<void>=>{
     apartment.definition.activate?.(apartment.world.scene)
     scenePass.scene=apartment.world.scene
     if(!controls)controls=new PlayerControls(camera,apartment.world.colliders)
@@ -329,7 +387,7 @@ async function boot():Promise<void> {
     const authored=apartment.definition.interactions.seats.length>0||(apartment.definition.interactions.couches?.length??0)>0
     const interactions=authored?apartment.definition.interactions:undefined
     if(!seats){
-      const {SeatingSystem:Seats}=await import('./player/seats')
+      const {SeatingSystem:Seats}=await seatingModule
       seats=new Seats(controls,camera,()=>{toHallway=true;document.exitPointerLock()},interactions)
     }else seats.configure(interactions)
     active=apartment
@@ -377,12 +435,13 @@ async function boot():Promise<void> {
     entryReady=false
     ui.beginLoading(id)
     requestPointerLock()
+    const seatingModule=loadSeatingModule()
     void (async()=>{
       try{
         const apartment=await getApartment(id)
         if(fatalShown||entryTarget!==id)return
         bootStage=`scene:${id}:activate`
-        await activateApartment(apartment)
+        await activateApartment(apartment,seatingModule)
         if(fatalShown||entryTarget!==id)return
         entryReady=true
         ui.finishLoading()

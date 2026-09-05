@@ -3,6 +3,7 @@
  * table, Aubusson rug, waterfall credenza with the CRT and the Jouets poster,
  * window seat, drapes, lamps, plants. */
 import * as THREE from 'three/webgpu'
+import { sceneTexture } from '../../core/sceneAssets'
 import { abs, add, atan, clamp, cos, div, max, min, mix, mul, positionLocal, sin, sqrt, sub, texture, uv, vec3 } from 'three/tsl'
 import * as L from './L'
 import * as mlib from '../../lib/mlib'
@@ -213,7 +214,7 @@ let posterMaterial: THREE.Material | undefined
 
 function posterMat(name = 'poster_jouets'): THREE.Material {
   if (posterMaterial) return posterMaterial
-  const image = new THREE.TextureLoader().load('/poster.jpg')
+  const image = sceneTexture('/poster.jpg')
   image.colorSpace = THREE.SRGBColorSpace
   image.wrapS = THREE.ClampToEdgeWrapping
   image.wrapT = THREE.ClampToEdgeWrapping

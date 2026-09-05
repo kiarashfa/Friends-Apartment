@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "typecheck": "tsc -b",
+    "test": "node --test --experimental-strip-types tests/*.test.mjs",
     "preview": "vite preview",
     "score": "node tools/midi-to-score.mjs",
     "verify:score": "node tools/verify-parity.mjs"
