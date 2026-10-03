@@ -762,62 +762,82 @@ export function toGeometry(m: MeshData): THREE.BufferGeometry {
   const fNormals: Vec3[] = m.faces.map((f) => norm(faceNormal(m.verts, f)))
   const smooth = m.shading.mode === 'smooth'
   const cosLimit = smooth ? Math.cos(((m.shading as { angle: number }).angle * Math.PI) / 180) : 2
-  // vertex -> adjacent faces
-  const vFaces: number[][] = Array.from({ length: m.verts.length }, () => [])
+  // vertex -> adjacent faces. Flat meshes skip this allocation entirely.
+  const vFaces: number[][] = smooth ? Array.from({ length: m.verts.length }, () => []) : []
   if (smooth) {
     m.faces.forEach((f, fi) => {
       for (const vi of f) vFaces[vi].push(fi)
     })
   }
-  const positions: number[] = []
-  const normals: number[] = []
-  const uvs: number[] = []
-  const cols: number[] = []
   const hasUv = !!m.uvs
   const hasCol = !!m.colors
-  const cornerNormal = (vi: number, fi: number): Vec3 => {
-    if (!smooth) return fNormals[fi]
-    const fn = fNormals[fi]
-    let nx = 0,
-      ny = 0,
-      nz = 0
-    for (const ofi of vFaces[vi]) {
-      const on = fNormals[ofi]
-      if (dot(fn, on) >= cosLimit - 1e-9) {
-        nx += on[0]
-        ny += on[1]
-        nz += on[2]
-      }
-    }
-    const l = Math.hypot(nx, ny, nz)
-    if (l < 1e-9) return fn
-    return [nx / l, ny / l, nz / l]
-  }
-  m.faces.forEach((f, fi) => {
-    const tris = triangulateFace(m.verts, f)
+  const cornerNormals: Vec3[][] | null = smooth
+    ? m.faces.map((face, fi) => face.map((vi) => {
+        const fn = fNormals[fi]
+        let nx = 0
+        let ny = 0
+        let nz = 0
+        for (const ofi of vFaces[vi]) {
+          const on = fNormals[ofi]
+          if (dot(fn, on) >= cosLimit - 1e-9) {
+            nx += on[0]
+            ny += on[1]
+            nz += on[2]
+          }
+        }
+        const length = Math.hypot(nx, ny, nz)
+        if (length < 1e-9) return fn
+        return [nx / length, ny / length, nz / length]
+      }))
+    : null
+
+  // Keep triangulation decisions exactly where they were made, but retain the
+  // small result so output buffers can be sized before writing any vertices.
+  // This avoids a second ear-clip pass over the larger scene polygons.
+  const triangles = m.faces.map((face) => triangulateFace(m.verts, face))
+  const vertexCount = triangles.reduce((sum, faceTriangles) => sum + faceTriangles.length * 3, 0)
+  const positions = new Float32Array(vertexCount * 3)
+  const normals = new Float32Array(vertexCount * 3)
+  const uvs = hasUv ? new Float32Array(vertexCount * 2) : null
+  const cols = hasCol ? new Float32Array(vertexCount * 3) : null
+  let vertex = 0
+
+  m.faces.forEach((face, fi) => {
     const uvFace = hasUv ? m.uvs![fi] : null
-    for (const t of tris) {
-      for (const ci of t) {
-        const vi = f[ci]
+    for (const triangle of triangles[fi]) {
+      for (const corner of triangle) {
+        const vi = face[corner]
         const p = m.verts[vi]
-        positions.push(p[0], p[1], p[2])
-        const n = cornerNormal(vi, fi)
-        normals.push(n[0], n[1], n[2])
-        if (hasUv) {
-          const u = uvFace ? uvFace[ci] : [0, 0]
-          uvs.push(u[0], u[1])
+        const pOffset = vertex * 3
+        positions[pOffset] = p[0]
+        positions[pOffset + 1] = p[1]
+        positions[pOffset + 2] = p[2]
+
+        const n = smooth ? cornerNormals![fi][corner] : fNormals[fi]
+        normals[pOffset] = n[0]
+        normals[pOffset + 1] = n[1]
+        normals[pOffset + 2] = n[2]
+
+        if (uvs) {
+          const u = uvFace?.[corner] ?? [0, 0]
+          const uvOffset = vertex * 2
+          uvs[uvOffset] = u[0]
+          uvs[uvOffset + 1] = u[1]
         }
-        if (hasCol) {
+        if (cols) {
           const c = m.colors![vi]
-          cols.push(c[0], c[1], c[2])
+          cols[pOffset] = c[0]
+          cols[pOffset + 1] = c[1]
+          cols[pOffset + 2] = c[2]
         }
+        vertex++
       }
     }
   })
   const g = new THREE.BufferGeometry()
-  g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
-  g.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3))
-  if (hasUv) g.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2))
-  if (hasCol) g.setAttribute(m.colorName || 'color', new THREE.Float32BufferAttribute(cols, 3))
+  g.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  g.setAttribute('normal', new THREE.BufferAttribute(normals, 3))
+  if (uvs) g.setAttribute('uv', new THREE.BufferAttribute(uvs, 2))
+  if (cols) g.setAttribute(m.colorName || 'color', new THREE.BufferAttribute(cols, 3))
   return g
 }

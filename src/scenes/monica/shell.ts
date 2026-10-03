@@ -452,7 +452,9 @@ export function build(w: World): MatSet {
   w.add(mlib.box(0.0015, L.W_BRICK[0], 0.86, 0.0135, L.CH_A[1], 1.52), M.tile)
   w.add(mlib.box(L.N_BRICK[0], L.NY - 0.0135, 0.86, L.FRIDGE_X[0], L.NY - 0.0015, 1.52), M.tile)
   for (const [u0, u1, z0, z1] of [
-    [0.02, 1.4, 0.86, L.KW_Z[0]],
+    // Stop at the casing's outer edge instead of running the tile behind its
+    // complete bottom rail. The exact butt joint keeps one surface owner.
+    [0.02, 1.4, 0.86, L.KW_Z[0] - 0.105],
     [0.02, L.KW_U[0] + 0.004, L.KW_Z[0], 1.52],
     [L.KW_U[1] - 0.004, 1.4, L.KW_Z[0], 1.52],
   ] as [number, number, number, number][]) {

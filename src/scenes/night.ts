@@ -391,13 +391,22 @@ function bakeIbl(): { texture: THREE.DataTexture; avg: V3 } {
   return { texture: tex, avg: [avg[0] / avgWeight, avg[1] / avgWeight, avg[2] / avgWeight] }
 }
 
+let sharedIbl: { texture: THREE.DataTexture; avg: V3 } | null = null
+
+/** The night gradient is deterministic and identical in every apartment.
+ * Keep one texture identity so Three's environment/PMREM cache can be reused
+ * when the player changes scenes. */
+export function getSharedNightIbl(): { texture: THREE.DataTexture; avg: V3 } {
+  return sharedIbl ??= bakeIbl()
+}
+
 // -------------------------------------------------------------------- build
 
 export function build(w: World): void {
   // backgroundNode is runtime API not yet in the type declarations
   ;(w.scene as THREE.Scene & { backgroundNode: N }).backgroundNode = nightSkyNode()
   w.scene.backgroundIntensity = 1.0 // the node carries real radiance
-  const ibl = bakeIbl()
+  const ibl = getSharedNightIbl()
   w.scene.environment = ibl.texture
   w.scene.environmentIntensity = 1.0
   midground(w)

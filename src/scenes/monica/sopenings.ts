@@ -173,13 +173,23 @@ export function steelWindow(w: number, h: number, bays: number[], rows: number, 
     const x0 = xs[k] + (k === 0 ? frameW : mullW / 2)
     const x1 = xs[k + 1] - (k === bays.length - 1 ? frameW : mullW / 2)
     const bw = x1 - x0
+    const verticals: number[] = []
     for (let c = 1; c < colsPerBay; c++) {
       const xc = x0 + (bw * c) / colsPerBay
+      verticals.push(xc)
       parts.push(mlib.box(xc - munW / 2, 0.0, frameW, xc + munW / 2, munD, h - frameW))
     }
     for (let r = 1; r < rows; r++) {
       const zc = frameW + ((h - 2 * frameW) * r) / rows
-      parts.push(mlib.box(x0, 0.0, zc - munW / 2, x1, munD, zc + munW / 2))
+      // Keep the grid visually continuous while giving each joint one owner.
+      // A full-width horizontal box overlapped every vertical muntin, leaving
+      // same-facing front/back fragments that flickered at grazing views.
+      let xa = x0
+      for (const xc of verticals) {
+        parts.push(mlib.box(xa, 0.0, zc - munW / 2, xc - munW / 2, munD, zc + munW / 2))
+        xa = xc + munW / 2
+      }
+      parts.push(mlib.box(xa, 0.0, zc - munW / 2, x1, munD, zc + munW / 2))
     }
   }
   const fr = mlib.join(parts)

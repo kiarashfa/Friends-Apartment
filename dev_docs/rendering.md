@@ -7,12 +7,16 @@ match Blender Cycles renders of the ground-truth scenes to the naked eye.
 
 ```ts
 const maxPixels = 4_000_000
-const dpr = Math.min(window.devicePixelRatio, 1.7, Math.sqrt(maxPixels / (innerWidth * innerHeight)))
-renderer.setPixelRatio(Math.max(1, dpr))
+const width = Math.max(1, innerWidth)
+const height = Math.max(1, innerHeight)
+const dpr = Math.min(window.devicePixelRatio, 1.7, Math.sqrt(maxPixels / (width * height)))
+renderer.setDrawingBufferSize(width, height, dpr)
 ```
 
 DPR is capped at 1.7 and by a 4 MP frame budget — balanced quality/perf,
-re-applied on resize.
+re-applied on resize. The budget is hard: DPR is allowed below 1 when the CSS
+viewport alone exceeds 4 MP. Resize work is coalesced to one animation frame
+and commits the final CSS dimensions and DPR in one drawing-buffer allocation.
 
 ## Post chain (`src/main.ts`)
 
@@ -20,7 +24,7 @@ Single `PostProcessing` graph, created once over an empty scene and reused by
 every scene (only `PassNode.scene` changes):
 
 ```
-scenePass (MRT: output + view-space normal, MSAA samples = renderer.samples)
+scenePass (MRT: output + view-space normal, 4x MSAA)
   ├─ depth + normal → GTAO (radius 0.32, thickness 1.25, distExp 1.5,
   │                        falloff 0.82, scale 0.9, 12 samples, full res)
   ├─ litColor = sceneColor * mix(1, ao.r, 0.34)       // 34 % AO influence
@@ -32,6 +36,11 @@ scenePass (MRT: output + view-space normal, MSAA samples = renderer.samples)
 Tone mapping is disabled on the renderer and in `renderOutput`
 (`outputColorTransform = false`): the Filmic transform **is** the view
 transform, and it must be the only one.
+
+The final fullscreen presentation canvas is not multisampled. Geometry-edge
+quality still comes from the scene MRT's authored 4x MSAA; enabling MSAA on
+both targets would add a second allocation and resolve without improving the
+presented edges.
 
 ## Filmic view transform (`src/core/filmic.ts`)
 

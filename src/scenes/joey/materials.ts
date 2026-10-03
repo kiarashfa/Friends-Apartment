@@ -6,6 +6,7 @@
  * surface's colour, roughness and micro-normal come from the same field.
  */
 import * as THREE from 'three/webgpu'
+import { sceneTexture } from '../../core/sceneAssets'
 import { add, fract, max, mix, mul, positionLocal, sub, texture, uv, vec3 } from 'three/tsl'
 import {
   emissive as sharedEmissive,
@@ -335,7 +336,7 @@ export function picture(
   options: { rough?: number; gloss?: number; bump?: number } = {},
 ): THREE.Material {
   return cached(name, () => {
-    const image = new THREE.TextureLoader().load(path)
+    const image = sceneTexture(path)
     image.colorSpace = THREE.SRGBColorSpace
     image.wrapS = THREE.ClampToEdgeWrapping
     image.wrapT = THREE.ClampToEdgeWrapping
